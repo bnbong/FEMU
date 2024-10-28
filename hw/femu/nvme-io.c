@@ -1,4 +1,7 @@
 #include "./nvme.h"
+#include <time.h>
+#include <stdio.h>
+
 
 static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
 
@@ -196,6 +199,12 @@ void *nvme_poller(void *arg)
     int index = ((NvmePollerThreadArgument *)arg)->index;
     int i;
 
+    FILE *fp = NULL;  // added
+    fp = fopen("/home/femu_timetbl", "w+");  // added
+
+    fprintf(fp, "nvme_poller called\n");  // added
+    fflush(stdout); // added
+
     switch (n->multipoller_enabled) {
     case 1:
         while (1) {
@@ -230,6 +239,8 @@ void *nvme_poller(void *arg)
         }
         break;
     }
+
+    fclose(fp);  // added
 
     return NULL;
 }

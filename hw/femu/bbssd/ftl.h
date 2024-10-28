@@ -7,6 +7,9 @@
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
+#define MAX_IO_STATS 10000  // I/O 통계 최대 저장 개수
+#define MAX_GC_STATS 1000   // GC 통계 최대 저장 개수
+
 enum {
     NAND_READ =  0,
     NAND_WRITE = 1,

@@ -1,8 +1,35 @@
 #include "ftl.h"
+#include <time.h>
+#include <stdint.h>
 
 //#define FEMU_DEBUG_FTL
 
+typedef struct {
+    uint64_t timestamp;
+    uint64_t lba;
+    uint32_t page_number;
+    int operation; // 0: READ, 1: WRITE
+} IOStats;  // added
+
+typedef struct {
+    uint64_t timestamp;
+    size_t erased_blocks;
+} GCStats; // added
+
+
+IOStats io_stats[MAX_IO_STATS];  // added
+size_t io_stats_count = 0;  // added
+
+GCStats gc_stats[MAX_GC_STATS];  // added
+size_t gc_stats_count = 0;  // added
+
 static void *ftl_thread(void *arg);
+
+static inline uint64_t get_current_time(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000L + ts.tv_nsec;
+}  // added
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -729,6 +756,8 @@ static int do_gc(struct ssd *ssd, bool force)
     struct ppa ppa;
     int ch, lun;
 
+    size_t erased_blocks = 0;  // added
+
     victim_line = select_victim_line(ssd, force);
     if (!victim_line) {
         return -1;
@@ -764,6 +793,12 @@ static int do_gc(struct ssd *ssd, bool force)
     /* update line status */
     mark_line_free(ssd, &ppa);
 
+    if (gc_stats_count < MAX_GC_STATS) {
+        gc_stats[gc_stats_count].timestamp = get_current_time();
+        gc_stats[gc_stats_count].erased_blocks = erased_blocks;
+        gc_stats_count++;
+    }  // added
+
     return 0;
 }
 
@@ -781,6 +816,8 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
+
+    uint64_t start_time = get_current_time();  // added
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -800,6 +837,10 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
 
+    uint64_t end_time = get_current_time();  // added
+    printf("[TRACE] READ Operation, LBA: %lu, Duration: %lu ns\n", req->slba, end_time - start_time);  // added
+    fflush(stdout); // added
+
     return maxlat;
 }
 
@@ -818,6 +859,8 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
+
+    uint64_t start_time = get_current_time();  // added
 
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
@@ -855,6 +898,10 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
 
+    uint64_t end_time = get_current_time();  // added
+    printf("[TRACE] WRITE Operation, LBA: %lu, Duration: %lu ns\n", req->slba, end_time - start_time);  // added
+    fflush(stdout); // added
+
     return maxlat;
 }
 
@@ -866,6 +913,9 @@ static void *ftl_thread(void *arg)
     uint64_t lat = 0;
     int rc;
     int i;
+
+    FILE *fp = NULL;  // added
+    fp = fopen("/home/femu_timetbl", "w+");  // added
 
     while (!*(ssd->dataplane_started_ptr)) {
         usleep(100000);
@@ -883,6 +933,18 @@ static void *ftl_thread(void *arg)
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
             if (rc != 1) {
                 printf("FEMU: FTL to_ftl dequeue failed\n");
+            }
+
+            fprintf(fp, "This IO's start LBA is: %ld\n\r", req->slba);  // added
+            printf("This IO's start LBA is: %ld\n\r", req->slba);  // added
+            fflush(stdout); // added
+
+            if (io_stats_count < MAX_IO_STATS) {
+                io_stats[io_stats_count].timestamp = get_current_time();
+                io_stats[io_stats_count].lba = req->slba;
+                io_stats[io_stats_count].page_number = req->slba / ssd->sp.secs_per_pg;
+                io_stats[io_stats_count].operation = (req->cmd.opcode == NVME_CMD_READ) ? 0 : 1;
+                io_stats_count++;
             }
 
             ftl_assert(req);
@@ -915,6 +977,16 @@ static void *ftl_thread(void *arg)
             }
         }
     }
+
+    if (io_stats_count < MAX_IO_STATS) {
+        io_stats[io_stats_count].timestamp = get_current_time();
+        io_stats[io_stats_count].lba = req->slba;
+        io_stats[io_stats_count].page_number = req->slba / ssd->sp.secs_per_pg;
+        io_stats[io_stats_count].operation = (req->cmd.opcode == NVME_CMD_READ) ? 0 : 1;
+        io_stats_count++;
+    }  // added
+
+    fclose(fp);  // added
 
     return NULL;
 }
