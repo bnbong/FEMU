@@ -4,32 +4,46 @@
 
 //#define FEMU_DEBUG_FTL
 
-typedef struct {
-    uint64_t timestamp;
-    uint64_t lba;
-    uint32_t page_number;
-    int operation; // 0: READ, 1: WRITE
-} IOStats;  // added
+static uint64_t io_count = 0;             // Number of I/O requests per second
+static uint64_t throughput_bytes = 0;     // Number of bytes transmitted in one second
+static uint64_t gc_erased_blocks = 0;     // Number of blocks erased by GC in 10 seconds
+static uint64_t gc_valid_pages_moved = 0; // Number of valid pages moved to GC in 10 seconds
 
-typedef struct {
-    uint64_t timestamp;
-    size_t erased_blocks;
-} GCStats; // added
+static time_t start_time = 0;             // Timer for IO/Throughput measurements
+static time_t gc_start_time = 0;          // Timer for GC statistics measurements
 
+// print IOPS and Throughput outputs at stdout per second
+static void print_iops_and_throughput(void) {
+    time_t current_time = time(NULL);
 
-IOStats io_stats[MAX_IO_STATS];  // added
-size_t io_stats_count = 0;  // added
+    if (current_time - start_time >= 1) {
+        uint64_t throughput_mb = throughput_bytes / (1024 * 1024);  // MB conversion
+        printf("[1s Stats] IOPS: %lu, Throughput: %lu MB/s\n", io_count, throughput_mb);
+        fflush(stdout);
 
-GCStats gc_stats[MAX_GC_STATS];  // added
-size_t gc_stats_count = 0;  // added
+        // Initialize Counters and Timers
+        io_count = 0;
+        throughput_bytes = 0;
+        start_time = current_time;
+    }
+}
+
+// print GC statistics output at stdout every 10 seconds
+static void print_gc_stats(void) {
+    time_t current_time = time(NULL);
+
+    if (current_time - gc_start_time >= 10) {
+        printf("[10s GC Stats] Erased Blocks: %lu, Moved Valid Pages: %lu\n", gc_erased_blocks, gc_valid_pages_moved);
+        fflush(stdout);
+
+        // Initialize GC statistics and Timers
+        gc_erased_blocks = 0;
+        gc_valid_pages_moved = 0;
+        gc_start_time = current_time;
+    }
+}
 
 static void *ftl_thread(void *arg);
-
-static inline uint64_t get_current_time(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000L + ts.tv_nsec;
-}  // added
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -715,7 +729,7 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
 }
 
 /* here ppa identifies the block we want to clean */
-static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
+static int clean_one_block(struct ssd *ssd, struct ppa *ppa)  // change method output type 'void -> int' for getting number of victim blocks
 {
     struct ssdparams *spp = &ssd->sp;
     struct nand_page *pg_iter = NULL;
@@ -735,6 +749,8 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
     }
 
     ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
+
+    return cnt;  // return cnt (type : int)
 }
 
 static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
@@ -756,7 +772,8 @@ static int do_gc(struct ssd *ssd, bool force)
     struct ppa ppa;
     int ch, lun;
 
-    size_t erased_blocks = 0;  // added
+    int erased_blocks = 0;      // number of erased blocks
+    int moved_valid_pages = 0;  // number of moved valid pages
 
     victim_line = select_victim_line(ssd, force);
     if (!victim_line) {
@@ -774,8 +791,10 @@ static int do_gc(struct ssd *ssd, bool force)
             ppa.g.ch = ch;
             ppa.g.lun = lun;
             ppa.g.pl = 0;
+
+            erased_blocks++; // adding 1 via target a victim block
             lunp = get_lun(ssd, &ppa);
-            clean_one_block(ssd, &ppa);
+            moved_valid_pages += clean_one_block(ssd, &ppa);
             mark_block_free(ssd, &ppa);
 
             if (spp->enable_gc_delay) {
@@ -790,14 +809,12 @@ static int do_gc(struct ssd *ssd, bool force)
         }
     }
 
+    gc_erased_blocks += erased_blocks;
+    gc_valid_pages_moved += moved_valid_pages;
+    print_gc_stats();  // 10초마다 GC 통계 출력
+
     /* update line status */
     mark_line_free(ssd, &ppa);
-
-    if (gc_stats_count < MAX_GC_STATS) {
-        gc_stats[gc_stats_count].timestamp = get_current_time();
-        gc_stats[gc_stats_count].erased_blocks = erased_blocks;
-        gc_stats_count++;
-    }  // added
 
     return 0;
 }
@@ -817,7 +834,10 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-    uint64_t start_time = get_current_time();  // added
+    // IOPS 및 Throughput 통계
+    io_count++;
+    throughput_bytes += nsecs * 512;  // 섹터 크기(512B)를 곱해 전송 바이트 계산
+    print_iops_and_throughput();
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -836,10 +856,6 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
-
-    uint64_t end_time = get_current_time();  // added
-    printf("[TRACE] READ Operation, LBA: %lu, Duration: %lu ns\n", req->slba, end_time - start_time);  // added
-    fflush(stdout); // added
 
     return maxlat;
 }
@@ -860,7 +876,10 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-    uint64_t start_time = get_current_time();  // added
+    // IOPS 및 Throughput 통계
+    io_count++;
+    throughput_bytes += len * 512;  // 섹터 크기(512B)를 곱해 전송 바이트 계산
+    print_iops_and_throughput();
 
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
@@ -898,10 +917,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
 
-    uint64_t end_time = get_current_time();  // added
-    printf("[TRACE] WRITE Operation, LBA: %lu, Duration: %lu ns\n", req->slba, end_time - start_time);  // added
-    fflush(stdout); // added
-
     return maxlat;
 }
 
@@ -913,9 +928,6 @@ static void *ftl_thread(void *arg)
     uint64_t lat = 0;
     int rc;
     int i;
-
-    FILE *fp = NULL;  // added
-    fp = fopen("/home/femu_timetbl", "w+");  // added
 
     while (!*(ssd->dataplane_started_ptr)) {
         usleep(100000);
@@ -933,18 +945,6 @@ static void *ftl_thread(void *arg)
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
             if (rc != 1) {
                 printf("FEMU: FTL to_ftl dequeue failed\n");
-            }
-
-            fprintf(fp, "This IO's start LBA is: %ld\n\r", req->slba);  // added
-            printf("This IO's start LBA is: %ld\n\r", req->slba);  // added
-            fflush(stdout); // added
-
-            if (io_stats_count < MAX_IO_STATS) {
-                io_stats[io_stats_count].timestamp = get_current_time();
-                io_stats[io_stats_count].lba = req->slba;
-                io_stats[io_stats_count].page_number = req->slba / ssd->sp.secs_per_pg;
-                io_stats[io_stats_count].operation = (req->cmd.opcode == NVME_CMD_READ) ? 0 : 1;
-                io_stats_count++;
             }
 
             ftl_assert(req);
@@ -977,16 +977,6 @@ static void *ftl_thread(void *arg)
             }
         }
     }
-
-    if (io_stats_count < MAX_IO_STATS) {
-        io_stats[io_stats_count].timestamp = get_current_time();
-        io_stats[io_stats_count].lba = req->slba;
-        io_stats[io_stats_count].page_number = req->slba / ssd->sp.secs_per_pg;
-        io_stats[io_stats_count].operation = (req->cmd.opcode == NVME_CMD_READ) ? 0 : 1;
-        io_stats_count++;
-    }  // added
-
-    fclose(fp);  // added
 
     return NULL;
 }

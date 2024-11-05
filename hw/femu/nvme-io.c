@@ -199,12 +199,6 @@ void *nvme_poller(void *arg)
     int index = ((NvmePollerThreadArgument *)arg)->index;
     int i;
 
-    FILE *fp = NULL;  // added
-    fp = fopen("/home/femu_timetbl", "w+");  // added
-
-    fprintf(fp, "nvme_poller called\n");  // added
-    fflush(stdout); // added
-
     switch (n->multipoller_enabled) {
     case 1:
         while (1) {
@@ -239,8 +233,6 @@ void *nvme_poller(void *arg)
         }
         break;
     }
-
-    fclose(fp);  // added
 
     return NULL;
 }
