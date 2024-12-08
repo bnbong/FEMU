@@ -1,47 +1,38 @@
 #include "ftl.h"
 #include <time.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-//#define FEMU_DEBUG_FTL
+// #define INITIAL_ACCESS_THRESHOLD 2  // 초기 접근 임계값
+// #define HOT_DATA_THRESHOLD 13  // 임계값 설정
 
-static uint64_t io_count = 0;             // Number of I/O requests per second
-static uint64_t throughput_bytes = 0;     // Number of bytes transmitted in one second
-static uint64_t gc_erased_blocks = 0;     // Number of blocks erased by GC in 10 seconds
-static uint64_t gc_valid_pages_moved = 0; // Number of valid pages moved to GC in 10 seconds
+/* statistics parameters*/
+static uint64_t *lpn_access_cnt = NULL;   // Array to count LPN accesses 
+static size_t lpn_access_cnt_size = 0;    // Size of the LPN access count array
+static uint64_t write_count = 0;
+static uint64_t gc_write_count = 0;
+static time_t start_time;
+static time_t last_print_time;
 
-static time_t start_time = 0;             // Timer for IO/Throughput measurements
-static time_t gc_start_time = 0;          // Timer for GC statistics measurements
-
-// print IOPS and Throughput outputs at stdout per second
-static void print_iops_and_throughput(void) {
-    time_t current_time = time(NULL);
-
-    if (current_time - start_time >= 1) {
-        uint64_t throughput_mb = throughput_bytes / (1024 * 1024);  // MB conversion
-        printf("[1s Stats] IOPS: %lu, Throughput: %lu MB/s\n", io_count, throughput_mb);
-        fflush(stdout);
-
-        // Initialize Counters and Timers
-        io_count = 0;
-        throughput_bytes = 0;
-        start_time = current_time;
+static void update_lpn_access_count(uint64_t lpn)
+{
+    if (lpn >= lpn_access_cnt_size) {
+        size_t new_size = lpn + 1;
+        uint64_t *new_lpn_access_cnt = realloc(lpn_access_cnt, new_size * sizeof(uint64_t));
+        if (!new_lpn_access_cnt) {
+            ftl_err("Failed to reallocate lpn_access_cnt\n");
+            abort();
+        }
+        memset(new_lpn_access_cnt + lpn_access_cnt_size, 0, (new_size - lpn_access_cnt_size) * sizeof(uint64_t));
+        lpn_access_cnt = new_lpn_access_cnt;
+        lpn_access_cnt_size = new_size;
     }
+    lpn_access_cnt[lpn]++;
+    printf("ACCESS,LPN:%lu,COUNT:%lu\n", lpn, lpn_access_cnt[lpn]);
 }
 
-// print GC statistics output at stdout every 10 seconds
-static void print_gc_stats(void) {
-    time_t current_time = time(NULL);
-
-    if (current_time - gc_start_time >= 10) {
-        printf("[10s GC Stats] Erased Blocks: %lu, Moved Valid Pages: %lu\n", gc_erased_blocks, gc_valid_pages_moved);
-        fflush(stdout);
-
-        // Initialize GC statistics and Timers
-        gc_erased_blocks = 0;
-        gc_valid_pages_moved = 0;
-        gc_start_time = current_time;
-    }
-}
+static int do_gc(struct ssd *ssd, bool force);
 
 static void *ftl_thread(void *arg);
 
@@ -430,6 +421,9 @@ void ssd_init(FemuCtrl *n)
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
+
+    start_time = time(NULL);
+    last_print_time = start_time;
 }
 
 static inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
@@ -674,6 +668,8 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     struct nand_lun *new_lun;
     uint64_t lpn = get_rmap_ent(ssd, old_ppa);
 
+    gc_write_count++;
+
     ftl_assert(valid_lpn(ssd, lpn));
     new_ppa = get_new_page(ssd);
     /* update maptbl */
@@ -809,10 +805,6 @@ static int do_gc(struct ssd *ssd, bool force)
         }
     }
 
-    gc_erased_blocks += erased_blocks;
-    gc_valid_pages_moved += moved_valid_pages;
-    print_gc_stats();  // 10초마다 GC 통계 출력
-
     /* update line status */
     mark_line_free(ssd, &ppa);
 
@@ -833,11 +825,6 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
-
-    // IOPS 및 Throughput 통계
-    io_count++;
-    throughput_bytes += nsecs * 512;  // 섹터 크기(512B)를 곱해 전송 바이트 계산
-    print_iops_and_throughput();
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -876,11 +863,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-    // IOPS 및 Throughput 통계
-    io_count++;
-    throughput_bytes += len * 512;  // 섹터 크기(512B)를 곱해 전송 바이트 계산
-    print_iops_and_throughput();
-
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
         r = do_gc(ssd, true);
@@ -888,7 +870,30 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
             break;
     }
 
+    write_count++;
+
+    // 매 10초마다 통계 출력
+    time_t current_time = time(NULL);
+    if (current_time - last_print_time >= 10) {
+        double elapsed_seconds = difftime(current_time, last_print_time);
+        uint64_t iops = write_count / elapsed_seconds;
+        double waf = gc_write_count > 0 ? (double)(write_count + gc_write_count) / write_count : 1.0;
+        
+        printf("STATS,TIME:%ld,IOPS:%lu,WAF:%.2f\n", 
+               current_time - start_time, 
+               iops,
+               waf);
+        
+        // 카운터 리셋
+        write_count = 0;
+        gc_write_count = 0;
+        last_print_time = current_time;
+    }
+
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        /* count LPN accesses */
+        update_lpn_access_count(lpn);
+
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
@@ -912,7 +917,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         swr.type = USER_IO;
         swr.cmd = NAND_WRITE;
         swr.stime = req->stime;
-        /* get latency statistics */
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
