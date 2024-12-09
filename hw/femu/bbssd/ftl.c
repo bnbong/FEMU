@@ -768,9 +768,6 @@ static int do_gc(struct ssd *ssd, bool force)
     struct ppa ppa;
     int ch, lun;
 
-    int erased_blocks = 0;      // number of erased blocks
-    int moved_valid_pages = 0;  // number of moved valid pages
-
     victim_line = select_victim_line(ssd, force);
     if (!victim_line) {
         return -1;
@@ -788,9 +785,8 @@ static int do_gc(struct ssd *ssd, bool force)
             ppa.g.lun = lun;
             ppa.g.pl = 0;
 
-            erased_blocks++; // adding 1 via target a victim block
             lunp = get_lun(ssd, &ppa);
-            moved_valid_pages += clean_one_block(ssd, &ppa);
+            clean_one_block(ssd, &ppa);
             mark_block_free(ssd, &ppa);
 
             if (spp->enable_gc_delay) {
