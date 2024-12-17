@@ -4,9 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// #define INITIAL_ACCESS_THRESHOLD 2  // 초기 접근 임계값
-// #define HOT_DATA_THRESHOLD 13  // 임계값 설정
-
 /* statistics parameters*/
 static uint64_t *lpn_access_cnt = NULL;   // Array to count LPN accesses 
 static size_t lpn_access_cnt_size = 0;    // Size of the LPN access count array
@@ -30,6 +27,15 @@ static void update_lpn_access_count(uint64_t lpn)
     }
     lpn_access_cnt[lpn]++;
     printf("ACCESS,LPN:%lu,COUNT:%lu\n", lpn, lpn_access_cnt[lpn]);
+}
+
+static bool is_hot_data(uint64_t lpn)
+{
+    if (lpn >= lpn_access_cnt_size) {
+        return false;
+    }
+    
+    return lpn_access_cnt[lpn] > HOT_DATA_THRESHOLD;
 }
 
 static int do_gc(struct ssd *ssd, bool force);
@@ -146,9 +152,8 @@ static void ssd_init_lines(struct ssd *ssd)
     lm->full_line_cnt = 0;
 }
 
-static void ssd_init_write_pointer(struct ssd *ssd)
+static void ssd_init_write_pointer(struct ssd *ssd, struct write_pointer *wpp)
 {
-    struct write_pointer *wpp = &ssd->wp;
     struct line_mgmt *lm = &ssd->lm;
     struct line *curline = NULL;
 
@@ -161,7 +166,7 @@ static void ssd_init_write_pointer(struct ssd *ssd)
     wpp->ch = 0;
     wpp->lun = 0;
     wpp->pg = 0;
-    wpp->blk = 0;
+    wpp->blk = curline->id;
     wpp->pl = 0;
 }
 
@@ -189,7 +194,7 @@ static struct line *get_next_free_line(struct ssd *ssd)
 static void ssd_advance_write_pointer(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
-    struct write_pointer *wpp = &ssd->wp;
+    struct write_pointer *wpp = ssd->wp;
     struct line_mgmt *lm = &ssd->lm;
 
     check_addr(wpp->ch, spp->nchs);
@@ -242,7 +247,7 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
 
 static struct ppa get_new_page(struct ssd *ssd)
 {
-    struct write_pointer *wpp = &ssd->wp;
+    struct write_pointer *wpp = ssd->wp;
     struct ppa ppa;
     ppa.ppa = 0;
     ppa.g.ch = wpp->ch;
@@ -417,7 +422,8 @@ void ssd_init(FemuCtrl *n)
     ssd_init_lines(ssd);
 
     /* initialize write pointer, this is how we allocate new pages for writes */
-    ssd_init_write_pointer(ssd);
+    ssd_init_write_pointer(ssd, &ssd->hot_wp);
+    ssd_init_write_pointer(ssd, &ssd->cold_wp);
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
@@ -671,6 +677,12 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     gc_write_count++;
 
     ftl_assert(valid_lpn(ssd, lpn));
+    if (is_hot_data(lpn)) {
+        ssd->wp = &ssd->hot_wp;
+    } else {
+        ssd->wp = &ssd->cold_wp;
+    }
+
     new_ppa = get_new_page(ssd);
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
@@ -725,7 +737,7 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
 }
 
 /* here ppa identifies the block we want to clean */
-static int clean_one_block(struct ssd *ssd, struct ppa *ppa)  // change method output type 'void -> int' for getting number of victim blocks
+static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
 {
     struct ssdparams *spp = &ssd->sp;
     struct nand_page *pg_iter = NULL;
@@ -745,8 +757,6 @@ static int clean_one_block(struct ssd *ssd, struct ppa *ppa)  // change method o
     }
 
     ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
-
-    return cnt;  // return cnt (type : int)
 }
 
 static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
@@ -868,7 +878,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
     write_count++;
 
-    // 매 10초마다 통계 출력
+    /* print stats every 10 seconds */
     time_t current_time = time(NULL);
     if (current_time - last_print_time >= 10) {
         double elapsed_seconds = difftime(current_time, last_print_time);
@@ -880,7 +890,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
                iops,
                waf);
         
-        // 카운터 리셋
+        /* reset counters */
         write_count = 0;
         gc_write_count = 0;
         last_print_time = current_time;
@@ -889,6 +899,12 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         /* count LPN accesses */
         update_lpn_access_count(lpn);
+
+        if (is_hot_data(lpn)) {
+            ssd->wp = &ssd->hot_wp;
+        } else {
+            ssd->wp = &ssd->cold_wp;
+        }
 
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {

@@ -7,8 +7,7 @@
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
-#define MAX_IO_STATS 10000  // I/O 통계 최대 저장 개수
-#define MAX_GC_STATS 1000   // GC 통계 최대 저장 개수
+#define HOT_DATA_THRESHOLD 21  /* hot data classification threshold */
 
 enum {
     NAND_READ =  0,
@@ -180,8 +179,13 @@ struct write_pointer {
 
 struct line_mgmt {
     struct line *lines;
+    /* hot line list */
+    QTAILQ_HEAD(hot_line_list, line) hot_line_list;
+    /* cold line list */
+    QTAILQ_HEAD(cold_line_list, line) cold_line_list;
     /* free line list, we only need to maintain a list of blk numbers */
     QTAILQ_HEAD(free_line_list, line) free_line_list;
+    /* victim line list */
     pqueue_t *victim_line_pq;
     //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
     QTAILQ_HEAD(full_line_list, line) full_line_list;
@@ -203,7 +207,9 @@ struct ssd {
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    struct write_pointer wp;
+    struct write_pointer *wp;
+    struct write_pointer hot_wp;  /* write pointer for hot data */
+    struct write_pointer cold_wp; /* write pointer for cold data */
     struct line_mgmt lm;
 
     /* lockless ring for communication with NVMe IO thread */
